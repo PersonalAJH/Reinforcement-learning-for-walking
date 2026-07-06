@@ -1,0 +1,20 @@
+# Robot / simulation assets (local only — do not commit)
+*.usd
+*.usda
+*.usdc
+*.usdz
+*.usb
+
+# Mesh and robot description files
+*.urdf
+*.obj
+*.stl
+*.dae
+*.fbx
+*.mtl
+*.gltf
+*.glb
+
+# Isaac Sim / Omniverse caches
+**/.thumbs/
+**/omni_cache/
