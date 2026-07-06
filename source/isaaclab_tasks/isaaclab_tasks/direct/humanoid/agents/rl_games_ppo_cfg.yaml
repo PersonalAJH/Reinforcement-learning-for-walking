@@ -10,6 +10,7 @@ params:
 
   model:
     name: continuous_a2c_logstd
+    legacy: True
 
   network:
     name: actor_critic
@@ -59,7 +60,7 @@ params:
     lr_schedule: adaptive
     kl_threshold: 0.008
     score_to_win: 20000
-    max_epochs: 1000
+    max_epochs: 3000     # 1000 이었음
     save_best_after: 100
     save_frequency: 50
     grad_norm: 1.0
@@ -67,8 +68,8 @@ params:
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 32
-    minibatch_size: 32768
-    mini_epochs: 5
+    minibatch_size: 512      #     minibatch_size: 32768  -> 내가 num_envs 개수를 4096->128로 줄여서
+    mini_epochs: 8           #     mini_epochs: 5
     critic_coef: 4
     clip_value: True
     seq_length: 4
