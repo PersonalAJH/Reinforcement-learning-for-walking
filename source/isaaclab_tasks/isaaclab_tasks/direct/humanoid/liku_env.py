@@ -224,22 +224,22 @@ class LikuEnvCfg(DirectRLEnvCfg):
     onestep_overshoot_cost: float = 2.00
 
     # walk stage: 한 발 후 멈추는 local optimum 방지
-    forward_record_reward_scale: float = 1200.0
+    forward_record_reward_scale: float = 1000.0
     forward_record_delta_clip: float = 0.004
     min_forward_vel: float = 0.04
     no_progress_cost_scale: float = 0.20
-    episode_side_cost_scale: float = 0.15
+    episode_side_cost_scale: float = 0.35
 
     # regularization
     action_cost_scale: float = 0.050
-    action_rate_cost_scale: float = 0.160
+    action_rate_cost_scale: float = 0.22
     action_saturation_cost_scale: float = 0.40
     action_soft_limit: float = 0.70
-    joint_vel_cost_scale: float = 0.04
+    joint_vel_cost_scale: float = 0.055
     joint_limit_cost_scale: float = 1.50
     # controlled leg joint angle limit: +/-30 deg = +/-0.5236 rad
-    joint_limit_soft: float = 0.5235987756
-    joint_limit_hard: float = 0.5235987756
+    joint_limit_soft: float = 0.7853981634
+    joint_limit_hard: float = 0.7853981634
 
     # walk stage warmup
     walk_warmup_steps: float = 60.0
@@ -255,6 +255,16 @@ class LikuEnvCfg(DirectRLEnvCfg):
     foot_step_reward_scale: float = 0.4
     foot_overstep_limit: float = 0.12
     foot_overstep_cost: float = 1.00
+
+    # walk 단계용 step-separation auxiliary reward
+    # reset 기준 foot 전진량이 아니라,
+    # 현재 root 기준으로 양발이 앞뒤로 적당히 벌어졌는지를 본다.
+    # 즉, 제자리에서 양발이 같이 흔들리는 해법보다 한 발 앞/한 발 뒤 패턴을 유도한다.
+    step_separation_target: float = 0.10
+    step_separation_sigma: float = 0.04
+    step_separation_reward_scale: float = 0.25
+    step_separation_over_limit: float = 0.18
+    step_separation_over_cost: float = 1.00
 
     # -------------------------------------------------------------------------
     # CUSTOM AXIS
@@ -926,6 +936,49 @@ class LikuEnv(LocomotionEnv):
         )
 
         # --------------------------------------------------
+        # walk 단계용 step-separation auxiliary reward
+        # --------------------------------------------------
+        # reset 기준 foot 전진량은 walk가 진행될수록 의미가 약해질 수 있다.
+        # 그래서 walk에서는 현재 root 기준으로 양발이 앞뒤로 적당히 벌어졌는지를 추가로 본다.
+        # 단, 제자리에서 다리만 벌리는 꼼수를 막기 위해 forward_vel 기반 moving gate를 곱한다.
+        left_foot_forward = foot_forward_rel[:, 0]
+        right_foot_forward = foot_forward_rel[:, 1]
+
+        step_separation = torch.abs(left_foot_forward - right_foot_forward)
+
+        step_separation_motion_gate = torch.clamp(
+            forward_vel / max(self.cfg.walk_target_forward_vel, 1.0e-6),
+            min=0.0,
+            max=1.0,
+        )
+
+        step_separation_reward = (
+            self.cfg.step_separation_reward_scale
+            * torch.exp(
+                -(
+                    (
+                        step_separation - self.cfg.step_separation_target
+                    )
+                    / max(self.cfg.step_separation_sigma, 1.0e-6)
+                ) ** 2
+            )
+            * healthy_gate
+            * height_strict_gate
+            * no_drop_gate
+            * warmup_gate
+            * step_separation_motion_gate
+        )
+
+        step_separation_over_penalty = (
+            self.cfg.step_separation_over_cost
+            * torch.clamp(
+                step_separation - self.cfg.step_separation_over_limit,
+                min=0.0,
+            ) ** 2
+            * healthy_gate
+        )
+
+        # --------------------------------------------------
         # onestep reward
         # --------------------------------------------------
         # 목표:
@@ -1089,7 +1142,7 @@ class LikuEnv(LocomotionEnv):
 
         episode_side_excess = torch.clamp(
             episode_side_next
-            - 5.0 * episode_forward_positive
+            - 0.6 * episode_forward_positive
             - 0.05,
             min=0.0,
         )
@@ -1109,7 +1162,9 @@ class LikuEnv(LocomotionEnv):
             + self.cfg.walk_heading_scale * heading_reward * healthy_gate
             + forward_reward
             + forward_record_reward
-            + 0.5 * foot_step_reward
+            + step_separation_reward
+            + 0.1 * foot_step_reward
+            - step_separation_over_penalty
             - foot_overstep_penalty
             - backward_penalty
             - side_vel_penalty
@@ -1202,6 +1257,15 @@ class LikuEnv(LocomotionEnv):
             )
 
             logger.info(
+                f"[STEP_SEPARATION][env{env_id}] "
+                f"foot_forward_rel={foot_forward_rel[env_id].detach().cpu().tolist()}, "
+                f"step_separation={step_separation[env_id].item():.4f}, "
+                f"step_separation_motion_gate={step_separation_motion_gate[env_id].item():.4f}, "
+                f"step_separation_reward={step_separation_reward[env_id].item():.4f}, "
+                f"step_separation_over_penalty={step_separation_over_penalty[env_id].item():.4f}"
+            )
+
+            logger.info(
                 f"[REWARD] "
                 f"stage={self.cfg.training_stage}, "
                 f"total={total_reward.mean().item():.4f}, "
@@ -1214,6 +1278,9 @@ class LikuEnv(LocomotionEnv):
                 f"onestep_target_reward={onestep_target_reward.mean().item():.4f}, "
                 f"foot_step_reward={foot_step_reward.mean().item():.4f}, "
                 f"foot_overstep_penalty={foot_overstep_penalty.mean().item():.4f}, "
+                f"step_separation_reward={step_separation_reward.mean().item():.4f}, "
+                f"step_separation_over_penalty={step_separation_over_penalty.mean().item():.4f}, "
+                f"step_separation={step_separation.mean().item():.4f}, "
                 f"no_progress_penalty={no_progress_penalty.mean().item():.4f}, "
                 f"episode_side_penalty={episode_side_penalty.mean().item():.4f}, "
                 f"backward_penalty={backward_penalty.mean().item():.4f}, "
