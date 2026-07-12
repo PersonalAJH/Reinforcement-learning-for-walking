@@ -228,7 +228,7 @@ class LikuEnvCfg(DirectRLEnvCfg):
     forward_record_delta_clip: float = 0.004
     min_forward_vel: float = 0.04
     no_progress_cost_scale: float = 0.20
-    episode_side_cost_scale: float = 0.35
+    episode_side_cost_scale: float = 0.5
 
     # regularization
     action_cost_scale: float = 0.050
@@ -260,9 +260,9 @@ class LikuEnvCfg(DirectRLEnvCfg):
     # reset 기준 foot 전진량이 아니라,
     # 현재 root 기준으로 양발이 앞뒤로 적당히 벌어졌는지를 본다.
     # 즉, 제자리에서 양발이 같이 흔들리는 해법보다 한 발 앞/한 발 뒤 패턴을 유도한다.
-    step_separation_delta_target: float = 0.04
-    step_separation_delta_sigma: float = 0.025
-    step_separation_reward_scale: float = 0.20
+    step_separation_delta_target: float = 0.02
+    step_separation_delta_sigma: float = 0.020
+    step_separation_reward_scale: float = 0.35
     step_separation_delta_over_limit: float = 0.10
     step_separation_over_cost: float = 1.00
 
@@ -1150,9 +1150,9 @@ class LikuEnv(LocomotionEnv):
         )
 
         # onestep에서도 옆으로 많이 흘러가면 안 된다.
-        onestep_episode_side_excess = torch.clamp(
+        episode_side_excess = torch.clamp(
             episode_side_next
-            - 3.0 * episode_forward_positive
+            - 0.4 * episode_forward_positive
             - 0.04,
             min=0.0,
         )
