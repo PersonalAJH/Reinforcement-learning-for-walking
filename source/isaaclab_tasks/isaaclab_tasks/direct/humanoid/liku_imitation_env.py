@@ -167,19 +167,28 @@ class LikuImitationEnvCfg(DirectRLEnvCfg):
     # action 의미:
     #   최종 joint position target = q_zmp + action_scale * policy_action
     # 단위: rad
-    # residual 보정량. 0.008은 보정량이 너무 작아서 action 포화가 심했으므로 0.015로 시작.
-    action_scale = 0.015
+    # 일단 넘어짐을 줄이기 위해 residual 보정량은 작게 둔다.
+    # 0.005 rad ≈ 0.29 deg. action이 포화돼도 실제 target 변화는 작다.
+    action_scale = 0.005
 
     action_space = 21
 
     # reset 직후 random residual이 바로 들어가면 넘어진다.
     # 30 step = decimation=2, dt=1/120 기준 약 0.5초.
     residual_warmup_steps: int = 30
-    reset_to_zmp_first_frame: bool = True
+    reset_to_zmp_first_frame: bool = False
 
     # trajectory 시작 전에 q_zmp[0] 자세로 잠깐 버틴다.
     # 60 step = 약 1초. phase가 이 시간 동안 0에 고정된다.
-    zmp_start_delay_steps: int = 60
+    zmp_start_delay_steps: int = 0
+
+    # -------------------------------------------------------------------------
+    # walking / soft imitation blend
+    # -------------------------------------------------------------------------
+    # trajectory를 처음부터 100% 따라가지 않고 default standing pose와 섞는다.
+    # 0.0 = 서 있는 default 자세만 사용, 1.0 = q_zmp trajectory 100% 사용.
+    # stand checkpoint에서 이어서 걸음 학습을 시작할 때는 0.20 정도로 옅게 시작한다.
+    zmp_follow_alpha: float = 0.20
 
     # custom observation: 기존 95 + forward/side displacement 2개 = 97
     observation_space = 97
@@ -233,6 +242,7 @@ class LikuImitationEnvCfg(DirectRLEnvCfg):
     # control_mode: str = "teleport_replay"
     # "visual_replay": 그래픽 확인용. root 고정 + trajectory index 직접 증가 + reset 방지.
     # control_mode: str = "visual_replay"
+    # control_mode: str = "direct"
 
     # visual_replay 전용. 1이면 원본 속도, 2~5면 빠르게 전체 모션 확인.
     visual_replay_stride: int = 10
@@ -248,6 +258,8 @@ class LikuImitationEnvCfg(DirectRLEnvCfg):
     #   1) .pt / .pth: Tensor [T, 22] 또는 dict 안의 "q", "joint_pos", "positions", "trajectory"
     #   2) .csv: header 있어도 됨. [T, 22] 또는 첫 column phase/time + [T, 22]
     zmp_traj_path: str = "D:/IsaacLab/traj/traj_headfix_60hz.pt"
+    # zmp_traj_path: str = ""
+
     zmp_traj_in_degrees: bool = False
     zmp_cycle_time: float = 13.109
     episode_length_s = 13.6
@@ -279,21 +291,29 @@ class LikuImitationEnvCfg(DirectRLEnvCfg):
     # trajectory는 기준 자세로만 쓰고, policy가 균형 보정을 배우게 한다.
     imitation_pos_scale: float = 0.70
     imitation_vel_scale: float = 0.02
+
+    # imitation reward는 자세가 어느 정도 안정적일 때만 크게 준다.
+    # 넘어지는 중에도 trajectory만 잘 따라가면 보상받는 문제를 막기 위한 gate.
+    stable_imi_up_threshold: float = 0.90
+    stable_imi_up_width: float = 0.08
+    stable_imi_height_threshold: float = 1.86
+    stable_imi_height_width: float = 0.12
+
     upright_scale: float = 2.50
     height_scale: float = 2.00
     heading_scale: float = 0.10
 
-    # 처음에는 앞으로 가는 보상은 끄고, 뒤/옆/아래로 무너지는 것부터 막는다.
-    forward_scale: float = 0.00
+    # 걷는 목표를 유지하되, 초반에는 너무 앞으로 던지지 않도록 약하게만 준다.
+    forward_scale: float = 0.1
     backward_vel_cost: float = 2.50
-    side_vel_cost: float = 2.00
+    side_vel_cost: float = 1.00
     z_vel_cost: float = 1.50
     target_forward_vel: float = 0.10
     forward_vel_sigma: float = 0.08
 
     # 옆으로 누적 drift 되는 현상을 막기 위한 reset 기준 lateral position penalty.
     side_pos_cost: float = 4.0
-    side_pos_deadband: float = 0.03
+    side_pos_deadband: float = 0.08
 
     # 낮아지거나 기울어지는 중에도 healthy_gate 때문에 penalty가 약해지지 않게 별도 penalty를 둔다.
     low_height_cost: float = 8.0
@@ -576,6 +596,7 @@ class LikuImitationEnv(LocomotionEnv):
         logger.info(f"[LIKU-IMI] action_scale(rad) = {self.cfg.action_scale}")
         logger.info(f"[LIKU-IMI] zmp_traj_path = '{self.cfg.zmp_traj_path}'")
         logger.info(f"[LIKU-IMI] zmp_cycle_time = {self.cfg.zmp_cycle_time}")
+        logger.info(f"[LIKU-IMI] zmp_follow_alpha = {self.cfg.zmp_follow_alpha}")
         logger.info(f"[LIKU-IMI] foot body names = {self._foot_body_names}")
         logger.info(f"[LIKU-IMI] foot body ids = {self._foot_body_ids}")
 
@@ -1149,8 +1170,22 @@ class LikuImitationEnv(LocomotionEnv):
 
 
         if self.cfg.control_mode == "residual":
-            # 핵심 모드: ZMP trajectory를 기본값으로 하고 policy는 보정값만 출력.
-            q_target = q_zmp + q_residual
+            # ------------------------------------------------------------
+            # Soft ZMP following
+            # ------------------------------------------------------------
+            # stand checkpoint에서 바로 trajectory를 100% 따라가면 시작하자마자 넘어질 수 있다.
+            # 그래서 default standing pose와 q_zmp를 alpha 비율로 섞어서 사용한다.
+            #
+            # alpha = 0.0 -> default pose만 사용
+            # alpha = 1.0 -> q_zmp trajectory 100% 사용
+            alpha = max(0.0, min(1.0, float(self.cfg.zmp_follow_alpha)))
+
+            q_base = (
+                (1.0 - alpha) * self._default_leg_q
+                + alpha * q_zmp
+            )
+
+            q_target = q_base + q_residual
 
         elif self.cfg.control_mode == "replay":
             # ZMP trajectory 자체가 IsaacSim에서 말이 되는지 검증할 때 사용.
@@ -1441,8 +1476,23 @@ class LikuImitationEnv(LocomotionEnv):
         else:
             q_zmp, q_zmp_vel = self._get_zmp_joint_target()
 
-        q_error = torch.mean((leg_q - q_zmp) ** 2, dim=-1)
-        qd_error = torch.mean((leg_qd - q_zmp_vel) ** 2, dim=-1)
+        # residual 학습에서는 imitation 기준도 q_zmp 100%가 아니라,
+        # 실제 target과 같은 방식으로 default pose와 q_zmp를 섞은 reference를 사용한다.
+        # 이렇게 해야 초반에 trajectory를 "옅게" 따라가면서도 걷는 모양을 조금씩 유도할 수 있다.
+        if self.cfg.control_mode == "residual":
+            alpha = max(0.0, min(1.0, float(self.cfg.zmp_follow_alpha)))
+            q_imit_ref = (
+                (1.0 - alpha) * self._default_leg_q
+                + alpha * q_zmp
+            )
+            qd_imit_ref = alpha * q_zmp_vel
+        else:
+            alpha = 1.0
+            q_imit_ref = q_zmp
+            qd_imit_ref = q_zmp_vel
+
+        q_error = torch.mean((leg_q - q_imit_ref) ** 2, dim=-1)
+        qd_error = torch.mean((leg_qd - qd_imit_ref) ** 2, dim=-1)
 
         imitation_pos_reward = torch.exp(
             -q_error / max(self.cfg.zmp_joint_sigma ** 2, 1.0e-6)
@@ -1450,6 +1500,25 @@ class LikuImitationEnv(LocomotionEnv):
         imitation_vel_reward = torch.exp(
             -qd_error / max(self.cfg.zmp_vel_sigma ** 2, 1.0e-6)
         )
+
+        # 몸이 낮아지거나 기울어진 상태에서는 imitation reward를 강하게 주지 않는다.
+        # 즉, "trajectory를 따라가는 것"보다 "안 넘어지는 것"을 먼저 배우게 한다.
+        stable_imi_gate = torch.clamp(
+            (custom_up_proj - self.cfg.stable_imi_up_threshold)
+            / max(self.cfg.stable_imi_up_width, 1.0e-6),
+            min=0.0,
+            max=1.0,
+        ) * torch.clamp(
+            (torso_z - self.cfg.stable_imi_height_threshold)
+            / max(self.cfg.stable_imi_height_width, 1.0e-6),
+            min=0.0,
+            max=1.0,
+        )
+
+        imitation_reward = (
+            self.cfg.imitation_pos_scale * imitation_pos_reward
+            + self.cfg.imitation_vel_scale * imitation_vel_reward
+        ) * stable_imi_gate
 
         # --------------------------------------------------
         # forward / movement shaping. 초기에는 scale 작게.
@@ -1501,7 +1570,7 @@ class LikuImitationEnv(LocomotionEnv):
 
         # residual action이 너무 큰 target shift를 계속 만드는 것을 억제.
         residual_target_cost = torch.mean(
-            ((self._last_q_target - q_zmp) / max(float(self.cfg.action_scale), 1.0e-6)) ** 2,
+            ((self._last_q_target - q_imit_ref) / max(float(self.cfg.action_scale), 1.0e-6)) ** 2,
             dim=-1,
         )
 
@@ -1519,8 +1588,7 @@ class LikuImitationEnv(LocomotionEnv):
 
         total_reward = (
             self.cfg.alive_scale * healthy_gate
-            + self.cfg.imitation_pos_scale * imitation_pos_reward * healthy_gate
-            + self.cfg.imitation_vel_scale * imitation_vel_reward * healthy_gate
+            + imitation_reward
             + self.cfg.upright_scale * upright_reward * height_gate
             + self.cfg.height_scale * height_reward * posture_gate
             + self.cfg.heading_scale * heading_reward * healthy_gate
@@ -1585,6 +1653,9 @@ class LikuImitationEnv(LocomotionEnv):
                 f"total={total_reward.mean().item():.4f}, "
                 f"imi_pos={imitation_pos_reward.mean().item():.4f}, "
                 f"imi_vel={imitation_vel_reward.mean().item():.4f}, "
+                f"zmp_follow_alpha={alpha:.3f}, "
+                f"stable_imi_gate={stable_imi_gate.mean().item():.4f}, "
+                f"imitation_reward={imitation_reward.mean().item():.4f}, "
                 f"upright={upright_reward.mean().item():.4f}, "
                 f"height={height_reward.mean().item():.4f}, "
                 f"heading={heading_reward.mean().item():.4f}, "
@@ -1671,7 +1742,7 @@ class LikuImitationEnv(LocomotionEnv):
           - custom_up_proj, custom_heading_proj: 2
           - controlled joint pos: 21
           - controlled joint vel: 21
-          - q_zmp reference: 21
+          - blended q reference: 21
           - previous action: 21
           - phase sin/cos: 2
         """
@@ -1703,6 +1774,18 @@ class LikuImitationEnv(LocomotionEnv):
             q_zmp = self._last_q_zmp
         else:
             q_zmp, _ = self._get_zmp_joint_target()
+
+        # policy observation에도 실제로 따라갈 blended reference를 넣는다.
+        # full q_zmp를 넣으면 제어 target은 약한데 observation은 강한 trajectory라 헷갈릴 수 있다.
+        if self.cfg.control_mode == "residual":
+            alpha = max(0.0, min(1.0, float(self.cfg.zmp_follow_alpha)))
+            q_ref_obs = (
+                (1.0 - alpha) * self._default_leg_q
+                + alpha * q_zmp
+            )
+        else:
+            q_ref_obs = q_zmp
+
         phase_obs = self._get_phase_obs()
 
         obs = torch.cat(
@@ -1716,7 +1799,7 @@ class LikuImitationEnv(LocomotionEnv):
                 custom_heading_proj.unsqueeze(-1),
                 q,
                 qd * self.cfg.dof_vel_scale,
-                q_zmp,
+                q_ref_obs,
                 self._prev_actions,
                 phase_obs,
             ],
