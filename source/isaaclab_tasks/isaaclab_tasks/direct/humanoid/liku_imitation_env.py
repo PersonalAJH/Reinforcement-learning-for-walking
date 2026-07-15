@@ -127,12 +127,12 @@ LIKU_IMI_CFG = ArticulationCfg(
         # 하체는 보행 안정성이 중요해서 조금 강하게.
         "legs": ImplicitActuatorCfg(
             joint_names_expr=RIGHT_LEG_JOINTS + LEFT_LEG_JOINTS,
-            effort_limit_sim=250000.0,
+            effort_limit_sim=300000.0,
             velocity_limit_sim=300.0,
-            # 너무 강하면 바닥 접촉에서 튀고, 너무 약하면 trajectory를 못 따라간다.
-            # 현재는 residual 학습 안정화를 위해 중간값으로 시작한다.
-            stiffness=200000.0,
-            damping=20000.0,
+            # 약간 더 강하게: trajectory/잔차 target을 더 단단히 잡는 테스트용.
+            # 너무 올리면 바닥 접촉에서 튈 수 있으니 우선 +25% 정도만 적용한다.
+            stiffness=250000.0,
+            damping=25000.0,
         ),
         # 팔은 실제 로그 궤적을 따라가되 처음에는 낮은 stiffness로 둔다.
         "arms": ImplicitActuatorCfg(
@@ -169,7 +169,7 @@ class LikuImitationEnvCfg(DirectRLEnvCfg):
     # 단위: rad
     # 일단 넘어짐을 줄이기 위해 residual 보정량은 작게 둔다.
     # 0.005 rad ≈ 0.29 deg. action이 포화돼도 실제 target 변화는 작다.
-    action_scale = 0.005
+    action_scale = 0.01
 
     action_space = 21
 
@@ -188,7 +188,13 @@ class LikuImitationEnvCfg(DirectRLEnvCfg):
     # trajectory를 처음부터 100% 따라가지 않고 default standing pose와 섞는다.
     # 0.0 = 서 있는 default 자세만 사용, 1.0 = q_zmp trajectory 100% 사용.
     # stand checkpoint에서 이어서 걸음 학습을 시작할 때는 0.20 정도로 옅게 시작한다.
-    zmp_follow_alpha: float = 0.20
+    zmp_follow_alpha: float = 0.30
+
+    # 발목은 실제 로봇 trajectory를 그대로 따라가면 시뮬 접촉에서 불안정할 수 있다.
+    # 그래서 발목만 별도 alpha를 낮춰서 default pose + policy residual 중심으로 보정하게 한다.
+    # 0.00 = 발목은 trajectory를 안 따라감, 0.05 = 아주 약하게만 따라감.
+    ankle_zmp_follow_alpha: float = 0.05
+    ankle_follow_joint_names: list[str] = ["A5", "A6", "B11", "B12"]
 
     # custom observation: 기존 95 + forward/side displacement 2개 = 97
     observation_space = 97
@@ -542,6 +548,31 @@ class LikuImitationEnv(LocomotionEnv):
             f"{self._residual_action_mask[0].detach().cpu().tolist()}"
         )
 
+        # ---------------------------------------------------------------------
+        # per-joint ZMP follow alpha
+        # ---------------------------------------------------------------------
+        # 기본은 전체 zmp_follow_alpha를 쓰고,
+        # 발목 joint만 ankle_zmp_follow_alpha로 낮춰서 trajectory 강제 추종을 완화한다.
+        self._zmp_follow_alpha_vec = torch.full(
+            (1, self.cfg.action_space),
+            float(self.cfg.zmp_follow_alpha),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        for _ankle_name in self.cfg.ankle_follow_joint_names:
+            if _ankle_name in self._joint_names:
+                self._zmp_follow_alpha_vec[0, self._joint_names.index(_ankle_name)] = float(
+                    self.cfg.ankle_zmp_follow_alpha
+                )
+            else:
+                logger.warning(f"[LIKU-IMI] ankle joint name not found: {_ankle_name}")
+
+        logger.info(
+            "[LIKU-IMI] zmp_follow_alpha_vec = "
+            f"{self._zmp_follow_alpha_vec[0].detach().cpu().tolist()}"
+        )
+
 
 
         self._phase_offset = torch.zeros(
@@ -597,6 +628,8 @@ class LikuImitationEnv(LocomotionEnv):
         logger.info(f"[LIKU-IMI] zmp_traj_path = '{self.cfg.zmp_traj_path}'")
         logger.info(f"[LIKU-IMI] zmp_cycle_time = {self.cfg.zmp_cycle_time}")
         logger.info(f"[LIKU-IMI] zmp_follow_alpha = {self.cfg.zmp_follow_alpha}")
+        logger.info(f"[LIKU-IMI] ankle_zmp_follow_alpha = {self.cfg.ankle_zmp_follow_alpha}")
+        logger.info(f"[LIKU-IMI] ankle_follow_joint_names = {self.cfg.ankle_follow_joint_names}")
         logger.info(f"[LIKU-IMI] foot body names = {self._foot_body_names}")
         logger.info(f"[LIKU-IMI] foot body ids = {self._foot_body_ids}")
 
@@ -1171,18 +1204,18 @@ class LikuImitationEnv(LocomotionEnv):
 
         if self.cfg.control_mode == "residual":
             # ------------------------------------------------------------
-            # Soft ZMP following
+            # Per-joint soft ZMP following
             # ------------------------------------------------------------
-            # stand checkpoint에서 바로 trajectory를 100% 따라가면 시작하자마자 넘어질 수 있다.
-            # 그래서 default standing pose와 q_zmp를 alpha 비율로 섞어서 사용한다.
+            # 고관절/무릎은 zmp_follow_alpha를 쓰고,
+            # 발목은 ankle_zmp_follow_alpha로 더 약하게 trajectory를 따라간다.
             #
-            # alpha = 0.0 -> default pose만 사용
-            # alpha = 1.0 -> q_zmp trajectory 100% 사용
-            alpha = max(0.0, min(1.0, float(self.cfg.zmp_follow_alpha)))
+            # alpha_vec = 0.0 -> default pose만 사용
+            # alpha_vec = 1.0 -> q_zmp trajectory 100% 사용
+            alpha_vec = self._zmp_follow_alpha_vec.expand(q_zmp.shape[0], -1)
 
             q_base = (
-                (1.0 - alpha) * self._default_leg_q
-                + alpha * q_zmp
+                (1.0 - alpha_vec) * self._default_leg_q
+                + alpha_vec * q_zmp
             )
 
             q_target = q_base + q_residual
@@ -1478,18 +1511,22 @@ class LikuImitationEnv(LocomotionEnv):
 
         # residual 학습에서는 imitation 기준도 q_zmp 100%가 아니라,
         # 실제 target과 같은 방식으로 default pose와 q_zmp를 섞은 reference를 사용한다.
-        # 이렇게 해야 초반에 trajectory를 "옅게" 따라가면서도 걷는 모양을 조금씩 유도할 수 있다.
+        # 발목은 alpha를 낮춰서 시뮬 접촉 안정성을 확보한다.
         if self.cfg.control_mode == "residual":
-            alpha = max(0.0, min(1.0, float(self.cfg.zmp_follow_alpha)))
+            alpha_vec = self._zmp_follow_alpha_vec.expand(q_zmp.shape[0], -1)
             q_imit_ref = (
-                (1.0 - alpha) * self._default_leg_q
-                + alpha * q_zmp
+                (1.0 - alpha_vec) * self._default_leg_q
+                + alpha_vec * q_zmp
             )
-            qd_imit_ref = alpha * q_zmp_vel
+            qd_imit_ref = alpha_vec * q_zmp_vel
+            alpha_log = float(self.cfg.zmp_follow_alpha)
+            ankle_alpha_log = float(self.cfg.ankle_zmp_follow_alpha)
         else:
-            alpha = 1.0
+            alpha_vec = None
             q_imit_ref = q_zmp
             qd_imit_ref = q_zmp_vel
+            alpha_log = 1.0
+            ankle_alpha_log = 1.0
 
         q_error = torch.mean((leg_q - q_imit_ref) ** 2, dim=-1)
         qd_error = torch.mean((leg_qd - qd_imit_ref) ** 2, dim=-1)
@@ -1653,7 +1690,8 @@ class LikuImitationEnv(LocomotionEnv):
                 f"total={total_reward.mean().item():.4f}, "
                 f"imi_pos={imitation_pos_reward.mean().item():.4f}, "
                 f"imi_vel={imitation_vel_reward.mean().item():.4f}, "
-                f"zmp_follow_alpha={alpha:.3f}, "
+                f"zmp_follow_alpha={alpha_log:.3f}, "
+                f"ankle_alpha={ankle_alpha_log:.3f}, "
                 f"stable_imi_gate={stable_imi_gate.mean().item():.4f}, "
                 f"imitation_reward={imitation_reward.mean().item():.4f}, "
                 f"upright={upright_reward.mean().item():.4f}, "
