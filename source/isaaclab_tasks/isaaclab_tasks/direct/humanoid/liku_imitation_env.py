@@ -169,7 +169,7 @@ class LikuImitationEnvCfg(DirectRLEnvCfg):
     # 단위: rad
     # 일단 넘어짐을 줄이기 위해 residual 보정량은 작게 둔다.
     # 0.005 rad ≈ 0.29 deg. action이 포화돼도 실제 target 변화는 작다.
-    action_scale = 0.01
+    action_scale = 0.012
 
     action_space = 21
 
@@ -188,7 +188,7 @@ class LikuImitationEnvCfg(DirectRLEnvCfg):
     # trajectory를 처음부터 100% 따라가지 않고 default standing pose와 섞는다.
     # 0.0 = 서 있는 default 자세만 사용, 1.0 = q_zmp trajectory 100% 사용.
     # stand checkpoint에서 이어서 걸음 학습을 시작할 때는 0.20 정도로 옅게 시작한다.
-    zmp_follow_alpha: float = 0.30
+    zmp_follow_alpha: float = 0.35
 
     # 발목은 실제 로봇 trajectory를 그대로 따라가면 시뮬 접촉에서 불안정할 수 있다.
     # 그래서 발목만 별도 alpha를 낮춰서 default pose + policy residual 중심으로 보정하게 한다.
@@ -309,16 +309,36 @@ class LikuImitationEnvCfg(DirectRLEnvCfg):
     height_scale: float = 2.00
     heading_scale: float = 0.10
 
+    # 몸의 yaw/heading이 틀어진 상태로 앞으로 이동하는 해법을 막기 위한 보강.
+    # deadband 이내의 작은 흔들림은 허용하고, 전진/누적전진 보상도 heading gate로 같이 줄인다.
+    heading_angle_cost: float = 0.50
+    heading_angle_deadband: float = 0.1  # rad, 약 2.9도
+    heading_forward_gate_width: float = 0.35  # rad, 약 20도
+
     # 걷는 목표를 유지하되, 초반에는 너무 앞으로 던지지 않도록 약하게만 준다.
-    forward_scale: float = 0.1
+    forward_scale: float = 0.45
     backward_vel_cost: float = 2.50
     side_vel_cost: float = 1.00
     z_vel_cost: float = 1.50
-    target_forward_vel: float = 0.10
-    forward_vel_sigma: float = 0.08
+    target_forward_vel: float = 0.18
+    forward_vel_sigma: float = 0.15
+
+    # 순간 forward velocity만 보상하면 앞으로 갔다가 다시   밀리는 해법이 남을 수 있다.
+    # 그래서 reset 기준 누적 전진거리도 별도 보상으로 준다.
+    forward_disp_scale: float = 0.95
+    forward_disp_target: float = 0.40
+
+    # 앞으로 갔다가 다시 뒤로 밀리는 왕복 해법을 막기 위한 max-progress 기준 penalty.
+    # deadband 이내의 작은 흔들림은 보행 균형 보정으로 보고 허용한다.
+    backtrack_cost: float = 1.00
+    backtrack_deadband: float = 0.08
+
+    # 옆으로 많이 새면서 forward_disp_reward를 받는 해법을 막는다.
+    # side_disp가 커질수록 forward_disp_reward를 gate로 깎는다.
+    forward_disp_side_gate_width: float = 0.22
 
     # 옆으로 누적 drift 되는 현상을 막기 위한 reset 기준 lateral position penalty.
-    side_pos_cost: float = 4.0
+    side_pos_cost: float = 6.0
     side_pos_deadband: float = 0.08
 
     # 낮아지거나 기울어지는 중에도 healthy_gate 때문에 penalty가 약해지지 않게 별도 penalty를 둔다.
@@ -503,6 +523,14 @@ class LikuImitationEnv(LocomotionEnv):
         # ---------------------------------------------------------------------
         self._prev_root_pos_w = self._get_root_pos_w().detach().clone()
         self._initial_root_pos_w = self._get_root_pos_w().detach().clone()
+
+        # reset 이후 지금까지 가장 많이 전진한 거리.
+        # forward_disp가 이 값보다 뒤로 물러나면 backtrack_penalty를 준다.
+        self._max_forward_disp = torch.zeros(
+            num_envs,
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         self._prev_actions = torch.zeros(
             num_envs,
@@ -1095,6 +1123,9 @@ class LikuImitationEnv(LocomotionEnv):
         if hasattr(self, "_initial_root_pos_w"):
             self._initial_root_pos_w[env_ids] = self._get_root_pos_w()[env_ids].detach().clone()
 
+        if hasattr(self, "_max_forward_disp"):
+            self._max_forward_disp[env_ids] = 0.0
+
         if hasattr(self, "_prev_actions"):
             self._prev_actions[env_ids] = 0.0
 
@@ -1171,6 +1202,27 @@ class LikuImitationEnv(LocomotionEnv):
                 f"min={a.min().item():.4f}, "
                 f"max={a.max().item():.4f}, "
                 f"env0_action={a.tolist()}"
+            )
+
+            # 전체 env 기준 action 포화율을 함께 본다.
+            # env0 action만 보면 특정 env 하나의 운에 판단이 흔들릴 수 있다.
+            act_abs = torch.abs(self.actions)
+            sat_ratio_all = (act_abs > 0.98).float().mean()
+            mean_abs_action = act_abs.mean()
+
+            sat_per_joint = (act_abs > 0.98).float().mean(dim=0)
+            top_vals, top_ids = torch.topk(sat_per_joint, k=min(8, sat_per_joint.numel()))
+
+            top_sat_msg = []
+            for val, jid in zip(top_vals.detach().cpu().tolist(), top_ids.detach().cpu().tolist()):
+                name = self._joint_names[jid] if jid < len(self._joint_names) else str(jid)
+                top_sat_msg.append(f"{name}:{val:.2f}")
+
+            logger.info(
+                "[ACTION-STATS] "
+                f"mean_abs_action={mean_abs_action.item():.4f}, "
+                f"sat_ratio_all={sat_ratio_all.item():.4f}, "
+                f"top_saturated_joints={top_sat_msg}"
             )
 
     def _apply_action(self):
@@ -1467,6 +1519,18 @@ class LikuImitationEnv(LocomotionEnv):
             * torch.clamp(side_disp - self.cfg.side_pos_deadband, min=0.0) ** 2
         )
 
+        # reset 이후 최고 전진거리에서 다시 뒤로 밀리는 정도.
+        # detach된 buffer로 관리해서 reward 계산용 상태로만 사용한다.
+        self._max_forward_disp[:] = torch.maximum(
+            self._max_forward_disp,
+            forward_disp.detach(),
+        )
+        max_forward_disp = self._max_forward_disp
+        backtrack_dist = torch.clamp(
+            max_forward_disp - forward_disp - self.cfg.backtrack_deadband,
+            min=0.0,
+        )
+
         # --------------------------------------------------
         # posture / health
         # --------------------------------------------------
@@ -1475,6 +1539,16 @@ class LikuImitationEnv(LocomotionEnv):
 
         upright_reward = torch.exp(-((up_error / max(self.cfg.upright_sigma, 1.0e-6)) ** 2))
         heading_reward = torch.exp(-((heading_error / max(self.cfg.heading_sigma, 1.0e-6)) ** 2))
+
+        # dot-product reward만으로는 yaw가 조금 틀어진 상태를 강하게 잡기 어렵다.
+        # 실제 각도(rad)를 계산해서 heading penalty와 forward gate에 같이 사용한다.
+        heading_angle_error = torch.acos(
+            torch.clamp(custom_heading_proj, -1.0 + 1.0e-6, 1.0 - 1.0e-6)
+        )
+        # currently used for logging / optional gating; not multiplied into forward_reward yet
+        heading_forward_gate = torch.exp(
+            -((heading_angle_error / max(self.cfg.heading_forward_gate_width, 1.0e-6)) ** 2)
+        )
 
         height_reward = torch.exp(
             -(((torso_z - self.cfg.stand_target_height) / max(self.cfg.stand_height_sigma, 1.0e-6)) ** 2)
@@ -1573,7 +1647,27 @@ class LikuImitationEnv(LocomotionEnv):
             max=1.0,
         )
 
+        # 몸 방향이 틀어진 상태로 이동하면 전진 보상을 줄인다.
         forward_reward = forward_tracking_reward * forward_alive_gate * healthy_gate
+
+        # reset 위치 기준으로 실제 전진거리가 누적될수록 보상한다.
+        # forward_vel은 순간속도라 제자리 왕복/흔들림도 보상받을 수 있으므로,
+        # forward_disp_reward로 "앞으로 간 상태를 유지하는 것"을 추가로 유도한다.
+        forward_disp_raw_reward = (
+            torch.clamp(
+                forward_disp / max(self.cfg.forward_disp_target, 1.0e-6),
+                min=0.0,
+                max=1.0,
+            )
+            * healthy_gate
+        )
+
+        # 옆으로 많이 새는 상태에서는 누적 전진 보상을 깎는다.
+        # side_pos_penalty를 더 키우는 대신, 잘못된 전진 보상 자체를 줄이는 역할이다.
+        side_forward_gate = torch.exp(
+            -((side_disp / max(self.cfg.forward_disp_side_gate_width, 1.0e-6)) ** 2)
+        )
+        forward_disp_reward = forward_disp_raw_reward * side_forward_gate
 
         backward_vel = torch.clamp(-forward_vel, min=0.0, max=0.60)
 
@@ -1582,6 +1676,12 @@ class LikuImitationEnv(LocomotionEnv):
         penalty_gate = 0.25 + 0.75 * healthy_gate
 
         backward_penalty = self.cfg.backward_vel_cost * backward_vel * penalty_gate
+        backtrack_penalty = self.cfg.backtrack_cost * backtrack_dist * penalty_gate
+        heading_angle_penalty = (
+            self.cfg.heading_angle_cost
+            * torch.clamp(heading_angle_error - self.cfg.heading_angle_deadband, min=0.0) ** 2
+            * penalty_gate
+        )
         side_vel_penalty = self.cfg.side_vel_cost * side_vel * penalty_gate
         z_vel_penalty = self.cfg.z_vel_cost * torch.abs(z_vel) * penalty_gate
 
@@ -1630,7 +1730,10 @@ class LikuImitationEnv(LocomotionEnv):
             + self.cfg.height_scale * height_reward * posture_gate
             + self.cfg.heading_scale * heading_reward * healthy_gate
             + self.cfg.forward_scale * forward_reward
+            + self.cfg.forward_disp_scale * forward_disp_reward
             - backward_penalty
+            - backtrack_penalty
+            - heading_angle_penalty
             - side_vel_penalty
             - z_vel_penalty
             - side_pos_penalty
@@ -1671,6 +1774,8 @@ class LikuImitationEnv(LocomotionEnv):
                 f"side_vel={side_vel[env_id].item():.4f}, "
                 f"z_vel={z_vel[env_id].item():.4f}, "
                 f"forward_disp={forward_disp[env_id].item():.4f}, "
+                f"max_forward_disp={max_forward_disp[env_id].item():.4f}, "
+                f"backtrack_dist={backtrack_dist[env_id].item():.4f}, "
                 f"side_disp={side_disp[env_id].item():.4f}, "
                 f"signed_side_disp={signed_side_disp[env_id].item():+.4f}"
             )
@@ -1679,10 +1784,49 @@ class LikuImitationEnv(LocomotionEnv):
                 f"[POSTURE-IMI][env{env_id}] "
                 f"up_proj={custom_up_proj[env_id].item():.4f}, "
                 f"heading_proj={custom_heading_proj[env_id].item():.4f}, "
+                f"heading_angle_deg={torch.rad2deg(heading_angle_error[env_id]).item():.2f}, "
+                f"heading_forward_gate={heading_forward_gate[env_id].item():.4f}, "
                 f"torso_z={torso_z[env_id].item():.4f}, "
                 f"height_gate={height_gate[env_id].item():.4f}, "
                 f"posture_gate={posture_gate[env_id].item():.4f}, "
                 f"healthy_gate={healthy_gate[env_id].item():.4f}"
+            )
+
+            # 전체 env 기준 이동 통계.
+            # env0 하나만 보면 play 느낌과 로그 판단이 어긋날 수 있어서,
+            # forward 성공률 / lateral drift 비율을 같이 본다.
+            forward_disp_pos_ratio = (forward_disp > 0.0).float().mean()
+            forward_good_ratio = ((forward_disp > 0.15) & (side_disp < 0.15)).float().mean()
+            backward_episode_ratio = (forward_disp < 0.0).float().mean()
+            lateral_bad_ratio = (side_disp > 0.25).float().mean()
+            side_bigger_ratio = (side_disp > torch.abs(forward_disp)).float().mean()
+            forward_vel_pos_ratio = (forward_vel > 0.0).float().mean()
+            backtrack_ratio = (backtrack_dist > 0.0).float().mean()
+            heading_bad_ratio = (heading_angle_error > self.cfg.heading_angle_deadband).float().mean()
+
+            logger.info(
+                "[MOVE-STATS] "
+                f"forward_vel_mean={forward_vel.mean().item():+.4f}, "
+                f"forward_vel_p50={torch.quantile(forward_vel, 0.50).item():+.4f}, "
+                f"forward_vel_pos_ratio={forward_vel_pos_ratio.item():.3f}, "
+                f"forward_disp_mean={forward_disp.mean().item():+.4f}, "
+                f"forward_disp_p50={torch.quantile(forward_disp, 0.50).item():+.4f}, "
+                f"forward_disp_max={forward_disp.max().item():+.4f}, "
+                f"forward_disp_pos_ratio={forward_disp_pos_ratio.item():.3f}, "
+                f"forward_good_ratio={forward_good_ratio.item():.3f}, "
+                f"backward_episode_ratio={backward_episode_ratio.item():.3f}, "
+                f"backtrack_mean={backtrack_dist.mean().item():.4f}, "
+                f"backtrack_ratio={backtrack_ratio.item():.3f}, "
+                f"heading_angle_deg_mean={torch.rad2deg(heading_angle_error).mean().item():.2f}, "
+                f"heading_angle_deg_p50={torch.rad2deg(torch.quantile(heading_angle_error, 0.50)).item():.2f}, "
+                f"heading_bad_ratio={heading_bad_ratio.item():.3f}, "
+                f"heading_forward_gate_mean={heading_forward_gate.mean().item():.4f}, "
+                f"side_gate_mean={side_forward_gate.mean().item():.4f}, "
+                f"side_disp_mean={side_disp.mean().item():.4f}, "
+                f"side_disp_p50={torch.quantile(side_disp, 0.50).item():.4f}, "
+                f"side_disp_max={side_disp.max().item():.4f}, "
+                f"lateral_bad_ratio={lateral_bad_ratio.item():.3f}, "
+                f"side_bigger_than_forward_ratio={side_bigger_ratio.item():.3f}"
             )
 
             logger.info(
@@ -1697,8 +1841,14 @@ class LikuImitationEnv(LocomotionEnv):
                 f"upright={upright_reward.mean().item():.4f}, "
                 f"height={height_reward.mean().item():.4f}, "
                 f"heading={heading_reward.mean().item():.4f}, "
+                f"heading_angle_penalty={heading_angle_penalty.mean().item():.4f}, "
+                f"heading_forward_gate={heading_forward_gate.mean().item():.4f}, "
                 f"forward={forward_reward.mean().item():.4f}, "
+                f"forward_disp_raw={forward_disp_raw_reward.mean().item():.4f}, "
+                f"side_forward_gate={side_forward_gate.mean().item():.4f}, "
+                f"forward_disp_reward={forward_disp_reward.mean().item():.4f}, "
                 f"backward_penalty={backward_penalty.mean().item():.4f}, "
+                f"backtrack_penalty={backtrack_penalty.mean().item():.4f}, "
                 f"side_vel_penalty={side_vel_penalty.mean().item():.4f}, "
                 f"z_vel_penalty={z_vel_penalty.mean().item():.4f}, "
                 f"side_pos_penalty={side_pos_penalty.mean().item():.4f}, "
