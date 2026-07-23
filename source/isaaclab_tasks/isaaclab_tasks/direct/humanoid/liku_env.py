@@ -1,3 +1,8 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 from __future__ import annotations
 
 import logging
@@ -224,22 +229,22 @@ class LikuEnvCfg(DirectRLEnvCfg):
     onestep_overshoot_cost: float = 2.00
 
     # walk stage: 한 발 후 멈추는 local optimum 방지
-    forward_record_reward_scale: float = 1200.0
+    forward_record_reward_scale: float = 1000.0
     forward_record_delta_clip: float = 0.004
     min_forward_vel: float = 0.04
     no_progress_cost_scale: float = 0.20
-    episode_side_cost_scale: float = 0.15
+    episode_side_cost_scale: float = 0.5
 
     # regularization
     action_cost_scale: float = 0.050
-    action_rate_cost_scale: float = 0.160
+    action_rate_cost_scale: float = 0.22
     action_saturation_cost_scale: float = 0.40
     action_soft_limit: float = 0.70
-    joint_vel_cost_scale: float = 0.04
+    joint_vel_cost_scale: float = 0.055
     joint_limit_cost_scale: float = 1.50
     # controlled leg joint angle limit: +/-30 deg = +/-0.5236 rad
-    joint_limit_soft: float = 0.5235987756
-    joint_limit_hard: float = 0.5235987756
+    joint_limit_soft: float = 0.7853981634
+    joint_limit_hard: float = 0.7853981634
 
     # walk stage warmup
     walk_warmup_steps: float = 60.0
@@ -256,6 +261,16 @@ class LikuEnvCfg(DirectRLEnvCfg):
     foot_overstep_limit: float = 0.12
     foot_overstep_cost: float = 1.00
 
+    # walk 단계용 step-separation auxiliary reward
+    # reset 기준 foot 전진량이 아니라,
+    # 현재 root 기준으로 양발이 앞뒤로 적당히 벌어졌는지를 본다.
+    # 즉, 제자리에서 양발이 같이 흔들리는 해법보다 한 발 앞/한 발 뒤 패턴을 유도한다.
+    step_separation_delta_target: float = 0.02
+    step_separation_delta_sigma: float = 0.020
+    step_separation_reward_scale: float = 0.35
+    step_separation_delta_over_limit: float = 0.10
+    step_separation_over_cost: float = 1.00
+
     # -------------------------------------------------------------------------
     # CUSTOM AXIS
     # -------------------------------------------------------------------------
@@ -270,6 +285,20 @@ class LikuEnvCfg(DirectRLEnvCfg):
     # 실제 이동 보상 기준
     # root가 world -X로 이동하면 forward reward
     world_move_axis = (-1.0, 0.0, 0.0)
+
+    # -------------------------------------------------------------------------
+    # Foot clearance and drag reward
+    # -------------------------------------------------------------------------
+
+    foot_clearance_target: float = 0.025
+    foot_clearance_sigma: float = 0.015
+    foot_clearance_reward_scale: float = 0.15
+
+    foot_drag_height_threshold: float = 0.008
+    foot_drag_cost: float = 0.10
+
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -422,6 +451,28 @@ class LikuEnv(LocomotionEnv):
             self._get_root_pos_w()[:, 2].unsqueeze(1)
             - self._get_foot_pos_w()[:, :, 2]
         ).detach().clone()
+
+
+        initial_foot_pos_w = self._get_foot_pos_w()
+        initial_root_pos_w = self._get_root_pos_w()
+
+        initial_foot_rel_w = initial_foot_pos_w - initial_root_pos_w.unsqueeze(1)
+
+        move_axis_init = self._world_move_axis.expand(num_envs, -1).clone()
+        move_axis_init[:, 2] = 0.0
+        move_axis_init = F.normalize(move_axis_init, dim=-1, eps=1e-6)
+
+        initial_foot_forward_rel = torch.sum(
+            initial_foot_rel_w * move_axis_init.unsqueeze(1),
+            dim=-1,
+        )
+
+        self._initial_step_separation = torch.abs(
+            initial_foot_forward_rel[:, 0] - initial_foot_forward_rel[:, 1]
+        ).detach().clone()
+
+
+
 
         logger.info(f"[LIKU] training_stage = {self.cfg.training_stage}")
         logger.info(f"[LIKU] controlled joints = {self._joint_names}")
@@ -588,6 +639,28 @@ class LikuEnv(LocomotionEnv):
                 - self._get_foot_pos_w()[env_ids, :, 2]
             ).detach().clone()
 
+
+        if hasattr(self, "_initial_step_separation"):
+            foot_pos_w = self._get_foot_pos_w()[env_ids]
+            root_pos_w = self._get_root_pos_w()[env_ids]
+
+            foot_rel_w = foot_pos_w - root_pos_w.unsqueeze(1)
+
+            move_axis = self._world_move_axis.expand(len(env_ids), -1).clone()
+            move_axis[:, 2] = 0.0
+            move_axis = F.normalize(move_axis, dim=-1, eps=1e-6)
+
+            foot_forward_rel = torch.sum(
+                foot_rel_w * move_axis.unsqueeze(1),
+                dim=-1,
+            )
+
+            self._initial_step_separation[env_ids] = torch.abs(
+                foot_forward_rel[:, 0] - foot_forward_rel[:, 1]
+            ).detach().clone()
+
+
+
     # -------------------------------------------------------------------------
     # RL hooks
     # -------------------------------------------------------------------------
@@ -645,6 +718,8 @@ class LikuEnv(LocomotionEnv):
             )
 
         self.robot.set_joint_effort_target(forces, joint_ids=self._joint_dof_idx)
+
+
 
     # -------------------------------------------------------------------------
     # Reward
@@ -926,6 +1001,98 @@ class LikuEnv(LocomotionEnv):
         )
 
         # --------------------------------------------------
+        # walk 단계용 step-separation auxiliary reward
+        # --------------------------------------------------
+        # reset 기준 foot 전진량은 walk가 진행될수록 의미가 약해질 수 있다.
+        # 그래서 walk에서는 현재 root 기준으로 양발이 앞뒤로 적당히 벌어졌는지를 추가로 본다.
+        # 단, 제자리에서 다리만 벌리는 꼼수를 막기 위해 forward_vel 기반 moving gate를 곱한다.
+        left_forward = foot_forward_rel[:, 0]
+        right_forward = foot_forward_rel[:, 1]
+
+        step_separation = torch.abs(left_forward - right_forward)
+
+        step_separation_delta = torch.abs(
+            step_separation - self._initial_step_separation
+        )
+
+        step_separation_motion_gate = torch.clamp(
+            forward_vel / max(self.cfg.walk_target_forward_vel, 1.0e-6),
+            min=0.0,
+            max=1.0,
+        )
+
+        step_separation_reward = (
+            self.cfg.step_separation_reward_scale
+            * torch.exp(
+                -(
+                    (
+                        step_separation_delta
+                        - self.cfg.step_separation_delta_target
+                    )
+                    / max(self.cfg.step_separation_delta_sigma, 1.0e-6)
+                ) ** 2
+            )
+            * healthy_gate
+            * height_strict_gate
+            * no_drop_gate
+            * warmup_gate
+            * step_separation_motion_gate
+        )
+
+        step_separation_over_penalty = (
+            self.cfg.step_separation_over_cost
+            * torch.clamp(
+                step_separation_delta
+                - self.cfg.step_separation_delta_over_limit,
+                min=0.0,
+            ) ** 2
+            * healthy_gate
+        )
+
+
+        # --------------------------------------------------
+        # foot clearance and drag reward
+        # --------------------------------------------------
+        # _apply_action()에서는 reward 계산용 변수들이 아직 없으므로,
+        # foot_pos_w / foot_forward_delta / gate들이 모두 만들어진 뒤 여기서 계산한다.
+        foot_z_w = foot_pos_w[:, :, 2]
+        foot_z_delta = foot_z_w - self._initial_foot_z_w
+
+        max_foot_z_delta = torch.max(foot_z_delta, dim=1).values
+
+        foot_clearance_reward = (
+            self.cfg.foot_clearance_reward_scale
+            * torch.exp(
+                -(
+                    (
+                        max_foot_z_delta - self.cfg.foot_clearance_target
+                    )
+                    / max(self.cfg.foot_clearance_sigma, 1.0e-6)
+                ) ** 2
+            )
+            * healthy_gate
+            * height_strict_gate
+            * no_drop_gate
+            * warmup_gate
+            * step_separation_motion_gate
+        )
+
+        foot_motion_amount = torch.max(torch.abs(foot_forward_delta), dim=1).values
+
+        low_foot_height = torch.clamp(
+            self.cfg.foot_drag_height_threshold - max_foot_z_delta,
+            min=0.0,
+        )
+
+        foot_drag_penalty = (
+            self.cfg.foot_drag_cost
+            * foot_motion_amount
+            * low_foot_height
+            * healthy_gate
+            * warmup_gate
+        )
+
+        # --------------------------------------------------
         # onestep reward
         # --------------------------------------------------
         # 목표:
@@ -988,9 +1155,9 @@ class LikuEnv(LocomotionEnv):
         )
 
         # onestep에서도 옆으로 많이 흘러가면 안 된다.
-        onestep_episode_side_excess = torch.clamp(
+        episode_side_excess = torch.clamp(
             episode_side_next
-            - 3.0 * episode_forward_positive
+            - 0.4 * episode_forward_positive
             - 0.04,
             min=0.0,
         )
@@ -1089,7 +1256,7 @@ class LikuEnv(LocomotionEnv):
 
         episode_side_excess = torch.clamp(
             episode_side_next
-            - 5.0 * episode_forward_positive
+            - 0.6 * episode_forward_positive
             - 0.05,
             min=0.0,
         )
@@ -1109,7 +1276,8 @@ class LikuEnv(LocomotionEnv):
             + self.cfg.walk_heading_scale * heading_reward * healthy_gate
             + forward_reward
             + forward_record_reward
-            + 0.5 * foot_step_reward
+
+
             - foot_overstep_penalty
             - backward_penalty
             - side_vel_penalty
@@ -1121,6 +1289,14 @@ class LikuEnv(LocomotionEnv):
             - episode_side_penalty
             - common_regularization
             - low_height_penalty
+
+            + step_separation_reward
+            + foot_clearance_reward
+            + 0.1 * foot_step_reward
+            - step_separation_over_penalty
+            - foot_drag_penalty
+
+
         )
 
         if self.cfg.training_stage == "stand":
@@ -1202,6 +1378,25 @@ class LikuEnv(LocomotionEnv):
             )
 
             logger.info(
+                f"[STEP_SEPARATION][env{env_id}] "
+                f"foot_forward_rel={foot_forward_rel[env_id].detach().cpu().tolist()}, "
+                f"initial_step_separation={self._initial_step_separation[env_id].item():.4f}, "
+                f"step_separation={step_separation[env_id].item():.4f}, "
+                f"step_separation_delta={step_separation_delta[env_id].item():.4f}, "
+                f"step_separation_motion_gate={step_separation_motion_gate[env_id].item():.4f}, "
+                f"step_separation_reward={step_separation_reward[env_id].item():.4f}, "
+                f"step_separation_over_penalty={step_separation_over_penalty[env_id].item():.4f}"
+            )
+
+            logger.info(
+                f"[FOOT_CLEARANCE][env{env_id}] "
+                f"foot_z_delta={foot_z_delta[env_id].detach().cpu().tolist()}, "
+                f"max_foot_z_delta={max_foot_z_delta[env_id].item():.4f}, "
+                f"foot_clearance_reward={foot_clearance_reward[env_id].item():.4f}, "
+                f"foot_drag_penalty={foot_drag_penalty[env_id].item():.4f}"
+            )
+
+            logger.info(
                 f"[REWARD] "
                 f"stage={self.cfg.training_stage}, "
                 f"total={total_reward.mean().item():.4f}, "
@@ -1214,6 +1409,12 @@ class LikuEnv(LocomotionEnv):
                 f"onestep_target_reward={onestep_target_reward.mean().item():.4f}, "
                 f"foot_step_reward={foot_step_reward.mean().item():.4f}, "
                 f"foot_overstep_penalty={foot_overstep_penalty.mean().item():.4f}, "
+                f"step_separation_reward={step_separation_reward.mean().item():.4f}, "
+                f"step_separation_over_penalty={step_separation_over_penalty.mean().item():.4f}, "
+                f"step_separation={step_separation.mean().item():.4f}, "
+                f"step_separation_delta={step_separation_delta.mean().item():.4f}, "
+                f"foot_clearance_reward={foot_clearance_reward.mean().item():.4f}, "
+                f"foot_drag_penalty={foot_drag_penalty.mean().item():.4f}, "
                 f"no_progress_penalty={no_progress_penalty.mean().item():.4f}, "
                 f"episode_side_penalty={episode_side_penalty.mean().item():.4f}, "
                 f"backward_penalty={backward_penalty.mean().item():.4f}, "
